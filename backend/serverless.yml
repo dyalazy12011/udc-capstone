@@ -1,0 +1,233 @@
+service: serverless-customer-app
+
+plugins:
+  - serverless-offline
+  - serverless-webpack
+  - serverless-iam-roles-per-function
+  - serverless-s3-local
+  - serverless-dynamodb-local
+  - serverless-plugin-tracing
+
+provider:
+  name: aws
+  deploymentMethod: direct
+  runtime: nodejs12.x
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  environment:
+    CUSTOMER_TABLE: Customer-${self:provider.stage}
+    CUSTOMER_USER_ID_INDEX: UserIdIndex
+    LOGO_S3_BUCKET: serverless-capstone-${self:provider.stage}
+    SIGNED_URL_EXPIRATION: 300
+
+  logs:
+    restApi: true
+
+custom:
+  serverless-offline:
+    port: 3003
+
+  dynamodb:
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+
+functions:
+
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  GetCustomer:
+    handler: src/lambda/http/getCustomer.handler
+    events:
+      - http:
+          method: get
+          path: customers
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Scan
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}/index/${self:provider.environment.CUSTOMER_USER_ID_INDEX}
+
+  # Provide iamRoleStatements property. Decide the Actions and AWS Resource. 
+  # To refer to an AWS resource defined in the "Resources" section, you can use "Resource: !GetAtt <resource-name>.Arn"
+  # To validate incoming HTTP requests, we have provided the request schemas in function definition below. 
+  CreateCustomer:
+    handler: src/lambda/http/createCustomer.handler
+    events:
+      - http:
+          method: post
+          path: customers
+          cors: true
+          authorizer: Auth
+          reqValidatorName: RequestBodyValidator
+          request:
+            schemas:
+              application/json: ${file(models/create-customer-model.json)}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+
+  # Provide property for setting up CORS, Authorizer, iamRoleStatements, and request schemas
+  UpdateCustomer:
+    handler: src/lambda/http/updateCustomer.handler
+    events:
+      - http:
+          method: patch
+          path: customers/{customerId}
+          cors: true
+          authorizer: Auth
+          request:
+            schemas:
+              application/json: ${file(models/update-customer-model.json)}
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+
+  # Provide property for setting up CORS, Authorizer, iamRoleStatements
+  DeleteCustomer:
+    handler: src/lambda/http/deleteCustomer.handler
+    events:
+      - http:
+          method: delete
+          path: customers/{customerId}
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}/index/${self:provider.environment.CUSTOMER_USER_ID_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+
+  # Provide property for setting up CORS, Authorizer, iamRoleStatements
+  GenerateLogoUrl:
+    handler: src/lambda/http/generateLogoUrl.handler
+    events:
+      - http:
+          method: post
+          path: customers/{customerId}/logo
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CUSTOMER_TABLE}/index/${self:provider.environment.CUSTOMER_USER_ID_INDEX}
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource: arn:aws:s3:::${self:provider.environment.LOGO_S3_BUCKET}/*
+
+resources:
+  Resources:
+    # Add necessary AWS resources. You will need at least the following AWS resources
+    # Feel free to change the names as you like. 
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: MISSING_AUTHENTICATION_TOKEN
+        StatusCode: '404'
+        RestApiId:
+          Ref: ApiGatewayRestApi
+    
+    RequestBodyValidator:
+      Type: AWS::ApiGateway::RequestValidator
+      Properties:
+        Name: 'request-body-validator'
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ValidateRequestBody: true
+        ValidateRequestParameters: false
+
+    CustomerTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: customerId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: customerId
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.CUSTOMER_TABLE}
+        LocalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.CUSTOMER_USER_ID_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL # What attributes will be copied to an index
+
+    # Do not forget to add the CorsConfiguration propoerty
+    LogoBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.LOGO_S3_BUCKET}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        PolicyDocument:
+          Id: udacityPolicy
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicAccess
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:GetObject'
+              Resource: 'arn:aws:s3:::${self:provider.environment.LOGO_S3_BUCKET}/*'
+        Bucket: !Ref LogoBucket
